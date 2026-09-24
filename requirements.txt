@@ -1,0 +1,6 @@
+fastapi[standard]
+groq
+python-dotenv
+langchain
+langgraph
+typing-extensions
