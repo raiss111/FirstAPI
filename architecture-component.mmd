@@ -1,8 +1,3 @@
-# Agentic AI Vodacom - MVP
-
-## Architecture — Component Diagram
-
-```mermaid
 flowchart LR
     User["User / Client"]
 
@@ -86,63 +81,3 @@ flowchart LR
     GetDevices -->|"get_compatible_devices_mock"| Tools
     Recommend -->|"get_prepaid_offers_mock"| Tools
     Summarize -->|"generate_conversation_summary"| Tools
-```
-
-### Component Responsibilities
-
-- **FastAPI Gateway** validates HTTP requests, exposes the chat and NLU endpoints, and serializes responses.
-- **Communication Agent** is the orchestration entry point. It retrieves the CRM profile, delegates intent recognition, selects the business scope, manages conversational and TOBi slot state, and renders the final user-facing response.
-- **Intent Agent** classifies each message into one authorized intent, applies business guardrails, and extracts normalized TOBi entities.
-- **Recommendation Agent** is a LangGraph state machine. It routes recommendation intents through dedicated nodes and persists each session in an in-memory checkpointer.
-- **Mock Services** provide customer data, TOBi actions, prepaid offers, compatible devices, and summaries without calling real Vodacom or M-Pesa systems.
-- **Groq API** is used only for intent classification. Final responses are rendered deterministically by the application.
-
-### Main Request Flow
-
-1. The client sends a message to `POST /chat` with a session and customer identifier.
-2. The Communication Agent loads the simulated CRM profile and delegates classification to the Intent Agent.
-3. The Communication Agent routes the request to either the Recommendation Agent or the TOBi mock services; otherwise it returns the unknown-intent response.
-4. The Recommendation Agent updates its session state through LangGraph when a recommendation workflow is required.
-5. The Communication Agent renders the structured result and returns it to the client.
-
-All conversation history, slot-filling state, and LangGraph checkpoints are held in process memory. Business data and TOBi operations are simulated for this MVP.
-
-## Installation
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-Créer `.env` :
-
-```env
-GROQ_API_KEY=ta_cle_groq
-```
-
-## Tests
-
-```powershell
-python -m unittest -v
-```
-
-## Lancer l'API
-
-```powershell
-python -m fastapi dev main.py
-```
-
-Puis ouvrir :
-
-- `http://127.0.0.1:8000/docs`
-- tester `POST /chat`
-
-Exemple :
-
-```json
-{
-  "session_id": "demo-001",
-  "message": "Je veux acheter un forfait prépayé à moins de 20 dollars"
-}
-```
-
-Réutiliser exactement le même `session_id` pour les messages suivants afin de conserver le contexte.

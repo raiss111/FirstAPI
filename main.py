@@ -8,6 +8,7 @@ from groq import Groq
 from pydantic import BaseModel, Field
 
 from communication_agent import handle_user_message
+from intent_agent import analyze_nlu_request
 
 load_dotenv()
 
@@ -27,6 +28,10 @@ class ChatResponse(BaseModel):
     offers: list[dict[str, Any]]
 
 
+class NLURequest(BaseModel):
+    query: str = Field(min_length=1, max_length=2000)
+
+
 def create_client() -> Groq:
     api_key = os.getenv("GROQ_API_KEY")
 
@@ -40,7 +45,7 @@ def create_client() -> Groq:
 
 app = FastAPI(
     title="Agentic AI Vodacom - 3 Agents",
-    version="1.3.0",
+    version="1.4.0",
 )
 
 client = create_client()
@@ -50,7 +55,7 @@ client = create_client()
 def root():
     return {
         "message": "API Agentic AI Vodacom active",
-        "architecture": "Communication -> Intent -> Recommendation",
+        "architecture": "Communication -> Intent -> {TOBi Services Mock | Recommendation}",
     }
 
 
@@ -59,17 +64,14 @@ def health():
     return {"status": "ok"}
 
 
-@app.post(
-    "/chat",
-    response_model=ChatResponse,
-)
+@app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
     """
-    Le Gateway HTTP ne dialogue directement qu'avec l'Agent de Communication.
+    Endpoint conversationnel complet.
 
-    Pour le MVP académique, la réponse expose aussi l'intent, le scope,
-    le State métier du Recommendation Agent et les offres disponibles,
-    afin de rendre le fonctionnement interne observable.
+    Le Gateway HTTP dialogue avec l'Agent de Communication. Pour le MVP
+    académique, la réponse expose aussi l'intent, le scope, le State métier du
+    Recommendation Agent et les offres afin de rendre le fonctionnement observable.
     """
     try:
         result = handle_user_message(
@@ -79,17 +81,55 @@ def chat(request: ChatRequest):
             message=request.message,
         )
 
-        recommendation_state = result.get("data", {}).get("recommendation", {})
-        offers = recommendation_state.get("offers", [])
+        data = result.get("data", {})
+        recommendation_state = data.get("recommendation", {})
+        tobi_state = data.get("tobi", {})
+
+        if result["scope"] == "recommendation":
+            visible_state = recommendation_state
+            offers = recommendation_state.get("offers", [])
+        elif result["scope"] == "tobi":
+            visible_state = tobi_state
+            offers = []
+        else:
+            visible_state = {}
+            offers = []
 
         return {
             "session_id": result["session_id"],
             "intent": result["intent"],
             "scope": result["scope"],
             "response": result["response"],
-            "state": recommendation_state,
+            "state": visible_state,
             "offers": offers,
         }
+
+    except groq.APIError as error:
+        raise HTTPException(
+            status_code=502,
+            detail="Erreur lors de la communication avec Groq.",
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur interne : {type(error).__name__}",
+        ) from error
+
+
+@app.post("/nlu")
+def nlu(request: NLURequest):
+    """
+    Endpoint de test direct de l'Agent Intent / NLU.
+
+    Il permet d'observer séparément :
+    - l'intention détectée ;
+    - les entités TOBi extraites ;
+    - l'état slots_complete.
+
+    Les scores de confiance et le fallback avancé ne sont pas encore inclus.
+    """
+    try:
+        return analyze_nlu_request(client, request.query)
 
     except groq.APIError as error:
         raise HTTPException(

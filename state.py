@@ -12,6 +12,7 @@ class AgentState(TypedDict, total=False):
 
     # Contexte métier de recommandation
     budget: float | None
+    requested_data_gb: float | None
     selected_offer_id: str | None
     selected_offer_name: str | None
     category_preference: str | None

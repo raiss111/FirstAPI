@@ -56,6 +56,31 @@ def _extract_budget_amount(message: str) -> float | None:
     return None
 
 
+def _extract_requested_data_gb(message: str) -> float | None:
+    """Extrait un besoin data explicite comme '20 Go' ou '10GB'."""
+    match = re.search(
+        r"(\d+(?:[.,]\d+)?)\s*(?:go|gb)\b",
+        message,
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    return float(match.group(1).replace(",", "."))
+
+
+def _filter_offers_by_data(offers, requested_data_gb):
+    if requested_data_gb is None:
+        return offers
+
+    return [
+        offer
+        for offer in offers
+        if float(offer.get("data_gb", 0)) >= float(requested_data_gb)
+    ]
+
+
 def extract_context_node(state: AgentState):
     """Extrait uniquement le contexte métier utile à la recommandation."""
     message = state.get("message", "")
@@ -82,6 +107,10 @@ def extract_context_node(state: AgentState):
     ):
         updates["category_preference"] = "SMARTPHONE"
 
+    requested_data_gb = _extract_requested_data_gb(message)
+    if requested_data_gb is not None:
+        updates["requested_data_gb"] = requested_data_gb
+
     amount = _extract_budget_amount(message)
     if amount is not None:
         if intent == "RECOMMEND_DEVICE":
@@ -99,7 +128,23 @@ def get_offers_node(state: AgentState):
         }
     )
 
-    return {"offers": offers}
+    offers = _filter_offers_by_data(
+        offers,
+        state.get("requested_data_gb"),
+    )
+
+    updates = {
+        "offers": offers,
+        # Une recherche d'offre ne doit pas laisser traîner les appareils
+        # d'une ancienne recommandation dans le State visible.
+        "devices": [],
+    }
+
+    if len(offers) == 1:
+        updates["selected_offer_id"] = offers[0]["offer_id"]
+        updates["selected_offer_name"] = offers[0]["name"]
+
+    return updates
 
 
 def get_devices_node(state: AgentState):
@@ -125,6 +170,11 @@ def recommend_offer_node(state: AgentState):
         {
             "user_budget_max": state.get("budget"),
         }
+    )
+
+    offers = _filter_offers_by_data(
+        offers,
+        state.get("requested_data_gb"),
     )
 
     if not offers:
