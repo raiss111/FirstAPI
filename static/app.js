@@ -1,13 +1,4 @@
-const API_URL = "http://127.0.0.1:8000/chat"; // ← adapte le port si besoin
-
-const SESSION_ID = (() => {
-  let id = localStorage.getItem("vodacom_session_id");
-  if (!id) {
-    id = "web-" + Math.random().toString(36).slice(2, 10) + "-" + Date.now();
-    localStorage.setItem("vodacom_session_id", id);
-  }
-  return id;
-})();
+const API_URL = "http://127.0.0.1:8000/chat";
 
 const CUSTOMER_ID = "CUST_001"; // ← change si tu veux tester CUST_002
 
@@ -74,7 +65,6 @@ form.addEventListener("submit", async (event) => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        session_id: SESSION_ID,
         customer_id: CUSTOMER_ID,
         message: text,
       }),
@@ -89,21 +79,27 @@ form.addEventListener("submit", async (event) => {
       throw new Error(detail);
     }
 
-    // Réponse FastAPI : ChatResponse
-    // { session_id, intent, scope, response, state, offers }
+    // Nouvelle structure ChatResponse :
+    // { customer_id, profile_status, intent, scope, response, state, offers }
     const data = await res.json();
 
     // Remplace le placeholder par la vraie réponse
     bubble.textContent = data.response ?? "(réponse vide)";
 
     // Logs utiles pour débugger selon le scope
-    console.log("Intent :", data.intent);
-    console.log("Scope  :", data.scope);
-    console.log("State  :", data.state);
-    console.log("Offers :", data.offers);
+    console.log("Customer :", data.customer_id);
+    console.log("Profile  :", data.profile_status);
+    console.log("Intent   :", data.intent);
+    console.log("Scope    :", data.scope);
+    console.log("State    :", data.state);
+    console.log("Offers   :", data.offers);
 
-    // Petit rendu enrichi selon le scope (optionnel)
-    if (data.scope === "recommendation" && Array.isArray(data.offers) && data.offers.length > 0) {
+    // Rendu enrichi : liste des offres si scope = recommendation
+    if (
+      data.scope === "recommendation" &&
+      Array.isArray(data.offers) &&
+      data.offers.length > 0
+    ) {
       const list = document.createElement("div");
       list.style.marginTop = "8px";
       list.style.fontSize = "13px";
@@ -116,16 +112,52 @@ form.addEventListener("submit", async (event) => {
       bubble.appendChild(list);
     }
 
-    if (data.scope === "tobi" && data.state) {
-      // Le state TOBi contient intent, entities, missing_slots, slots_complete, action_result
-      if (data.state.missing_slots && data.state.missing_slots.length > 0) {
-        const hint = document.createElement("div");
-        hint.style.marginTop = "8px";
-        hint.style.fontSize = "12px";
-        hint.style.color = "#8f8f8f";
-        hint.textContent = `Slots manquants : ${data.state.missing_slots.join(", ")}`;
-        bubble.appendChild(hint);
-      }
+    // Rendu enrichi : liste des appareils si scope = recommendation et intent = RECOMMEND_DEVICE
+    if (
+      data.intent === "RECOMMEND_DEVICE" &&
+      data.state &&
+      Array.isArray(data.state.devices) &&
+      data.state.devices.length > 0
+    ) {
+      const list = document.createElement("div");
+      list.style.marginTop = "8px";
+      list.style.fontSize = "13px";
+      list.style.color = "#555";
+      data.state.devices.forEach((device) => {
+        const line = document.createElement("div");
+        line.textContent = `• ${device.brand} ${device.model} — ${device.price}$`;
+        list.appendChild(line);
+      });
+      bubble.appendChild(list);
+    }
+
+    // Rendu enrichi : slots manquants si scope = tobi
+    if (
+      data.scope === "tobi" &&
+      data.state &&
+      Array.isArray(data.state.missing_slots) &&
+      data.state.missing_slots.length > 0
+    ) {
+      const hint = document.createElement("div");
+      hint.style.marginTop = "8px";
+      hint.style.fontSize = "12px";
+      hint.style.color = "#8f8f8f";
+      hint.textContent = `Slots manquants : ${data.state.missing_slots.join(", ")}`;
+      bubble.appendChild(hint);
+    }
+
+    // Rendu enrichi : état d'achat simulé en attente de confirmation
+    if (
+      data.state &&
+      data.state.purchase &&
+      data.state.purchase.status === "AWAITING_CONFIRMATION"
+    ) {
+      const hint = document.createElement("div");
+      hint.style.marginTop = "8px";
+      hint.style.fontSize = "12px";
+      hint.style.color = "#8f8f8f";
+      hint.textContent = "Achat simulé en attente de confirmation.";
+      bubble.appendChild(hint);
     }
   } catch (err) {
     bubble.textContent = "❌ " + err.message;

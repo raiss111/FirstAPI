@@ -1,10 +1,10 @@
 import os
+from pathlib import Path
 from typing import Any
 
 import groq
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pathlib import Path
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from groq import Groq
@@ -14,17 +14,22 @@ from communication_agent import handle_user_message
 from intent_agent import analyze_nlu_request
 
 load_dotenv()
+
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
+
+# ---------------------------------------------------------------------------
+# Contrats Pydantic
+# ---------------------------------------------------------------------------
 class ChatRequest(BaseModel):
-    session_id: str = Field(min_length=1, max_length=100)
     customer_id: str = Field(default="CUST_001", min_length=1, max_length=100)
     message: str = Field(min_length=1, max_length=2000)
 
 
 class ChatResponse(BaseModel):
-    session_id: str
+    customer_id: str | None = None
+    profile_status: str = "UNKNOWN"
     intent: str
     scope: str
     response: str
@@ -36,6 +41,9 @@ class NLURequest(BaseModel):
     query: str = Field(min_length=1, max_length=2000)
 
 
+# ---------------------------------------------------------------------------
+# Client Groq
+# ---------------------------------------------------------------------------
 def create_client() -> Groq:
     api_key = os.getenv("GROQ_API_KEY")
 
@@ -55,7 +63,11 @@ app = FastAPI(
 client = create_client()
 
 
+# ---------------------------------------------------------------------------
+# Static (front)
+# ---------------------------------------------------------------------------
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 
 @app.get("/", include_in_schema=False)
 def front():
@@ -67,19 +79,21 @@ def health():
     return {"status": "ok"}
 
 
+# ---------------------------------------------------------------------------
+# /chat
+# ---------------------------------------------------------------------------
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
     """
     Endpoint conversationnel complet.
 
-    Le Gateway HTTP dialogue avec l'Agent de Communication. Pour le MVP
-    académique, la réponse expose aussi l'intent, le scope, le State métier du
-    Recommendation Agent et les offres afin de rendre le fonctionnement observable.
+    Le Gateway HTTP dialogue avec l'Agent de Communication.
+    La réponse expose aussi l'intent, le scope, le State métier et les offres
+    afin de rendre le fonctionnement observable.
     """
     try:
         result = handle_user_message(
             client,
-            session_id=request.session_id,
             customer_id=request.customer_id,
             message=request.message,
         )
@@ -99,7 +113,8 @@ def chat(request: ChatRequest):
             offers = []
 
         return {
-            "session_id": result["session_id"],
+            "customer_id": result.get("customer_id"),
+            "profile_status": result.get("profile_status", "UNKNOWN"),
             "intent": result["intent"],
             "scope": result["scope"],
             "response": result["response"],
@@ -113,12 +128,17 @@ def chat(request: ChatRequest):
             detail="Erreur lors de la communication avec Groq.",
         ) from error
     except Exception as error:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"Erreur interne : {type(error).__name__}",
         ) from error
 
 
+# ---------------------------------------------------------------------------
+# /nlu
+# ---------------------------------------------------------------------------
 @app.post("/nlu")
 def nlu(request: NLURequest):
     """
@@ -128,8 +148,6 @@ def nlu(request: NLURequest):
     - l'intention détectée ;
     - les entités TOBi extraites ;
     - l'état slots_complete.
-
-    Les scores de confiance et le fallback avancé ne sont pas encore inclus.
     """
     try:
         return analyze_nlu_request(client, request.query)
@@ -140,7 +158,9 @@ def nlu(request: NLURequest):
             detail="Erreur lors de la communication avec Groq.",
         ) from error
     except Exception as error:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"Erreur interne : {type(error).__name__}",
-        ) from error
+        ) from error    
