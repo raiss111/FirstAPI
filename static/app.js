@@ -1,4 +1,4 @@
-const API_URL = "http://127.0.0.1:8000/chat";
+const API_URL = "/chat";
 
 const CUSTOMER_ID = "CUST_001"; // ← change si tu veux tester CUST_002
 
