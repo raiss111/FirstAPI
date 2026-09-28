@@ -1,0 +1,142 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: #ffffff;
+  color: #0d0d0d;
+  font-family: -apple-system, "Segoe UI", sans-serif;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+header {
+  height: 52px;
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  font-weight: 600px;
+  font-size: 16px;
+}
+
+.chat {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  overflow: hidden;
+}
+
+.chat:has(.messages:empty) {
+  justify-content: center;
+}
+
+.chat:has(.messages:empty) .messages {
+  display: none;
+}
+
+.greeting {
+  display: none;
+  text-align: center;
+  font-size: 28px;
+  font-weight: 600;
+  margin-bottom: 24px;
+}
+
+.chat:has(.messages:empty) .greeting {
+  display: block;
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  max-width: 720px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.message {
+  display: flex;
+  gap: 12px;
+  max-width: 100%;
+}
+
+.message.user {
+  justify-content: flex-end;
+}
+
+.avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: #0d0d0d;
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.bubble {
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+.message.user .bubble {
+  background: #f4f4f4;
+  padding: 10px 16px;
+  border-radius: 18px;
+  max-width: 70%;
+}
+
+.input-wrap {
+  width: 100%;
+  max-width: 680px;
+  margin: 0 auto;
+  padding: 16px 20px 28px 20px;
+}
+
+.input-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #d9d9d9;
+  border-radius: 28px;
+  padding: 10px 10px 10px 20px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+}
+
+.input-bar input {
+  flex: 1;
+  border: none;
+  outline: none;
+  font-size: 15px;
+}
+
+.input-bar button {
+  width: 34px;
+  height: 34px;
+  border: none;
+  border-radius: 50%;
+  background: #0d0d0d;
+  color: #ffffff;
+  font-size: 16px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.hint {
+  text-align: center;
+  font-size: 12px;
+  color: #8f8f8f;
+  margin-top: 10px;
+}

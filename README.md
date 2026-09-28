@@ -1,148 +1,88 @@
-# Agentic AI Vodacom - MVP
+ÉTAPE 19 — ACHAT DE FORFAIT PRÉPAYÉ SIMULÉ + RÉPONSE SIMPLE
+============================================================
 
-## Architecture — Component Diagram
+Cette livraison est basée sur :
+- étape 17 (sélection et devise USD sur les offres),
+- étape 18 (nettoyage du texte de réponse),
+- dernière architecture à conversation unique de l'étape 16.
 
-```mermaid
-flowchart LR
-    User["User / Client"]
+FICHIERS À REMPLACER (à la racine du projet)
+---------------------------------------------
+1. intent_agent.py
+   L'intent BUY_PREPAID reste identique. Le résultat de classification ajoute,
+   pour cet intent seulement, purchase_action (browse/request/confirm/cancel/none)
+   et beneficiary_name facultatif. L'Intent Agent n'exécute rien.
 
-    subgraph API["API Layer"]
-        direction TB
-        Contracts["Pydantic Contracts<br/>ChatRequest · ChatResponse · NLURequest"]
-        FastAPI["FastAPI Gateway<br/>main.py<br/>/chat · /nlu · /health"]
-        Contracts -. "validation and serialization" .-> FastAPI
-    end
+2. communication_agent.py
+   Orchestrateur de l'unique ConversationState. Garde purchase dans le State,
+   recueille une confirmation explicite, transmet l'offre choisie par le graphe
+   au service d'achat Mock. L'accès à ce State unique est sérialisé (RLock).
 
-    subgraph Orchestration["Orchestration Layer"]
-        Communication["Communication Agent<br/>communication_agent.py<br/>routing · slot filling · response rendering"]
-        History[("Conversation History<br/>in-memory by session")]
-        TOBiSlots[("TOBi Slot State<br/>in-memory multi-turn state")]
-    end
+3. tobi_services_mock.py
+   Ajout de purchase_prepaid_mock : valide confirmed=True, relit l'offre dans
+   le catalogue Mock et renvoie un succès FICTIF, jamais un achat réel.
 
-    subgraph Understanding["Intent Understanding"]
-        Intent["Intent Agent<br/>intent_agent.py<br/>classification · guardrails · entity extraction"]
-    end
+4. llm_response_generator.py
+   Verbaliseur uniquement. Sortie response en une seule ligne de texte simple :
+   pas de vrai/littéral saut de ligne, Markdown, '||', underscores, procédure,
+   canaux inventés ou promesse d'achat réel. Le texte non conforme est refusé.
 
-    subgraph Recommendation["Recommendation Agent — LangGraph"]
-        direction TB
-        Graph["StateGraph Compiler<br/>recommendation_graph.py"]
-        Entry(["START"])
-        Save["Save User Message"]
-        Extract["Extract Context"]
-        Route{"Route by Intent"}
-        GetOffers["Get Prepaid Offers"]
-        GetDevices["Get Compatible Devices"]
-        Recommend["Recommend Offer"]
-        Summarize["Summarize Context"]
-        Finish(["END"])
-        AgentState["Shared Agent State<br/>state.py"]
-        Checkpoint[("InMemorySaver<br/>session checkpoints")]
+5. main.py
+   Conserve POST /chat sans session_id, sans nouveau système de session.
+   Affiche state.purchase pour le debug (status, offer, action_result).
 
-        Graph --> Entry
-        Entry --> Save
-        Save --> Extract
-        Extract --> Route
-        Route -->|"BUY_PREPAID"| GetOffers
-        Route -->|"RECOMMEND_DEVICE"| GetDevices
-        Route -->|"ASK_RECOMMENDATION"| Recommend
-        Route -->|"SUMMARIZE"| Summarize
-        Route -->|"Other"| Finish
-        GetOffers --> Finish
-        GetDevices --> Finish
-        Recommend --> Finish
-        Summarize --> Finish
-        Graph -->|"defines the state schema"| AgentState
-        Graph <-->|"checkpoints and restores"| Checkpoint
-    end
+TESTS
+-----
+Ajouter : test_prepaid_mock_purchase.py
+Remplacer les anciens tests (leur contrat précédent autorisait des retours à
+la ligne et des phrases sur les procédures) :
+- test_recommendation_consistency.py
+- test_plain_responses.py
+Conserver test_single_conversation.py de l'étape 16.
 
-    subgraph MockServices["In-Process Mock Services"]
-        direction TB
-        CRM["CRM Profile Mock<br/>crm_mock.py"]
-        TOBi["TOBi Service Mocks<br/>top-up · balance · tariff · handover"]
-        Tools["Recommendation Mock Tools<br/>offers · compatible devices · summary"]
-    end
+COMMANDES (dans ton venv, après sauvegarde des anciens fichiers)
+-----------------------------------------------------------------
+python -m unittest test_prepaid_mock_purchase test_single_conversation test_recommendation_consistency test_plain_responses -v
+uvicorn main:app --reload
 
-    subgraph External["External AI Service"]
-        Groq["Groq API<br/>openai/gpt-oss-20b"]
-    end
+SCÉNARIO À TESTER /docs -> POST /chat (MÊME PROCESSUS FASTAPI)
+--------------------------------------------------------------
+1. {"message": "Achète-moi un forfait de 15$."}
+   Attendu : state.purchase.status = AWAITING_CONFIRMATION;
+   offre = Flexi Data Max (15 USD). Pas d'exécution à ce stade.
+   Exemple de réponse : Flexi Data Max coûte 15 USD par mois. Confirmez-vous cet achat simulé ?
 
-    User -->|"HTTPS JSON"| FastAPI
-    FastAPI -->|"/chat"| Communication
-    FastAPI -->|"/nlu"| Intent
-    Communication -->|"structured result"| FastAPI
-    FastAPI -->|"JSON response"| User
+2. {"message": "Oui, je confirme cet achat simulé."}
+   Attendu : state.purchase.status = COMPLETED ;
+   state.purchase.action_result.status = SIMULATED_SUCCESS ;
+   state.purchase.action_result.real_transaction = false.
+   Exemple de réponse : Votre achat simulé de Flexi Data Max à 15 USD a été effectué.
 
-    Communication -->|"classify message"| Intent
-    Intent -->|"chat completion request"| Groq
-    Groq -->|"structured intent JSON"| Intent
+3. Nouvel essai 'oui' ne relance PAS l'action précédente.
 
-    Communication -->|"customer profile"| CRM
-    Communication <-->|"read and append messages"| History
-    Communication <-->|"merge and update TOBi slots"| TOBiSlots
-    Communication -->|"complete TOBi action"| TOBi
+4. Pour tester une annulation, redémarrer FastAPI puis :
+   {"message": "Achète Eco Prepaid pour Marie, à 8$."}
+   {"message": "Non, j'annule."}
+   Attendu : status=CANCELLED, action_result=null, aucune action exécutée.
 
-    Communication -->|"recommendation input or session snapshot"| Graph
-    GetOffers -->|"get_prepaid_offers_mock"| Tools
-    GetDevices -->|"get_compatible_devices_mock"| Tools
-    Recommend -->|"get_prepaid_offers_mock"| Tools
-    Summarize -->|"generate_conversation_summary"| Tools
-```
+5. Pour tester la consultation sans achat, après redémarrage :
+   {"message": "Montre-moi les forfaits disponibles."}
+   Attendu : recommendation présente, state.purchase reste {}.
 
-### Component Responsibilities
+CONTRAINTES ET LIMITES
+----------------------
+- Aucun paiement, aucun débit, aucune activation et aucune API opérateur réelle.
+- Pour un achat "pour Marie", seul le nom déclaré est stocké; aucune identité
+  ni numéro de téléphone n'est vérifié (simulation académique seulement).
+- Aucun changement de requirements.txt, du frontend, de recommendation_graph.py,
+  nodes.py, tools.py, state.py, crm_mock.py ou du State TOBi existant.
+- Nécessite tools.py de l'étape 17 (devise USD déclarée dans le catalogue).
+- Une seule conversation en RAM par processus FastAPI. Redémarrer le processus
+  réinitialise le contexte; --reload peut réinitialiser à chaque modification.
+- Dans cet environnement les tests ont utilisé des substituts pour les SDK
+  absents. Valider aussi dans ton venv avec Groq réel et LangGraph réel.
 
-- **FastAPI Gateway** validates HTTP requests, exposes the chat and NLU endpoints, and serializes responses.
-- **Communication Agent** is the orchestration entry point. It retrieves the CRM profile, delegates intent recognition, selects the business scope, manages conversational and TOBi slot state, and renders the final user-facing response.
-- **Intent Agent** classifies each message into one authorized intent, applies business guardrails, and extracts normalized TOBi entities.
-- **Recommendation Agent** is a LangGraph state machine. It routes recommendation intents through dedicated nodes and persists each session in an in-memory checkpointer.
-- **Mock Services** provide customer data, TOBi actions, prepaid offers, compatible devices, and summaries without calling real Vodacom or M-Pesa systems.
-- **Groq API** is used only for intent classification. Final responses are rendered deterministically by the application.
-
-### Main Request Flow
-
-1. The client sends a message to `POST /chat` with a session and customer identifier.
-2. The Communication Agent loads the simulated CRM profile and delegates classification to the Intent Agent.
-3. The Communication Agent routes the request to either the Recommendation Agent or the TOBi mock services; otherwise it returns the unknown-intent response.
-4. The Recommendation Agent updates its session state through LangGraph when a recommendation workflow is required.
-5. The Communication Agent renders the structured result and returns it to the client.
-
-All conversation history, slot-filling state, and LangGraph checkpoints are held in process memory. Business data and TOBi operations are simulated for this MVP.
-
-## Installation
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-Créer `.env` :
-
-```env
-GROQ_API_KEY=ta_cle_groq
-```
-
-## Tests
-
-```powershell
-python -m unittest -v
-```
-
-## Lancer l'API
-
-```powershell
-python -m fastapi dev main.py
-```
-
-Puis ouvrir :
-
-- `http://127.0.0.1:8000/docs`
-- tester `POST /chat`
-
-Exemple :
-
-```json
-{
-  "session_id": "demo-001",
-  "message": "Je veux acheter un forfait prépayé à moins de 20 dollars"
-}
-```
-
-Réutiliser exactement le même `session_id` pour les messages suivants afin de conserver le contexte.
+RETOUR ARRIÈRE
+--------------
+Arrêter FastAPI; restaurer les cinq anciens fichiers et les anciens tests;
+redémarrer FastAPI. Aucune migration de données persistantes.

@@ -2,6 +2,8 @@ from typing import Any
 
 from langchain_core.tools import tool
 
+from tools import get_prepaid_offers_mock
+
 
 # Données purement simulées pour le MVP.
 # Elles ne proviennent d'aucune API Vodacom/M-Pesa réelle.
@@ -135,4 +137,46 @@ def handover_human_mock(
         "mode": "mock",
         "customer_id": customer_id,
         "preferred_channel": preferred_channel,
+    }
+
+
+@tool
+def purchase_prepaid_mock(
+    offer_id: str,
+    confirmed: bool,
+    beneficiary_name: str | None = None,
+    customer_id: str | None = None,
+) -> dict[str, Any]:
+    """Exécute une opération SIMULÉE après confirmation préalable du Gateway.
+
+    Aucun débit, activation, SMS, M-Pesa ou appel à un opérateur réel.
+    Même en appel direct, confirmed=False empêche le succès simulé.
+    Le prix, le nom et la devise sont toujours relus depuis le catalogue Mock.
+    """
+    if not confirmed:
+        return {
+            "action": "purchase_prepaid", "status": "CONFIRMATION_REQUIRED",
+            "executed": False, "mode": "mock", "real_transaction": False,
+        }
+
+    offers = get_prepaid_offers_mock.invoke({"user_budget_max": None})
+    selected = next((item for item in offers if item.get("offer_id") == offer_id), None)
+    if selected is None:
+        return {
+            "action": "purchase_prepaid", "status": "OFFER_NOT_FOUND",
+            "executed": False, "mode": "mock", "real_transaction": False,
+        }
+
+    return {
+        "action": "purchase_prepaid",
+        "status": "SIMULATED_SUCCESS",
+        "executed": True,  # seule l'opération locale fictive est exécutée
+        "mode": "mock",
+        "real_transaction": False,
+        "customer_id": customer_id,
+        "beneficiary_name": beneficiary_name,
+        "offer_id": selected["offer_id"],
+        "offer_name": selected["name"],
+        "amount": selected["price_monthly"],
+        "currency": selected["currency"],
     }

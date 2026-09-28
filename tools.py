@@ -18,6 +18,7 @@ def get_prepaid_offers_mock(
             "offer_id": "PRE_001",
             "name": "Flexi Data Max",
             "price_monthly": 15,
+            "currency": "USD",
             "data_gb": 20,
             "calls_min": "Illimité",
         },
@@ -25,6 +26,7 @@ def get_prepaid_offers_mock(
             "offer_id": "PRE_002",
             "name": "Eco Prepaid",
             "price_monthly": 8,
+            "currency": "USD",
             "data_gb": 5,
             "calls_min": 100,
         },
@@ -57,6 +59,7 @@ def get_compatible_devices_mock(
             "brand": "Samsung",
             "model": "Galaxy A15 5G",
             "price": 180,
+            "currency": "USD",
             "category": "SMARTPHONE",
             "compatible_offers": ["PRE_001"],
             "compatibility_tag": "RECOMMENDED",
@@ -69,8 +72,13 @@ def get_compatible_devices_mock(
             "brand": "Xiaomi",
             "model": "Redmi Note 13",
             "price": 150,
+            "currency": "USD",
             "category": "SMARTPHONE",
-            "compatible_offers": ["PRE_001"],
+            # Extension de données MOCK pour permettre une recommandation
+            # de smartphone avec Eco Prepaid (PRE_002) sans modifier le modèle,
+            # le prix ni son référencement initial comme alternative PRE_001.
+            # La compatibilité réelle reste à confirmer avant une intégration.
+            "compatible_offers": ["PRE_001", "PRE_002"],
             "compatibility_tag": "ALTERNATIVE",
             "reason": "Option économique avec grand écran",
         },
@@ -81,6 +89,15 @@ def get_compatible_devices_mock(
         for device in devices
         if offer_id in device["compatible_offers"]
     ]
+
+    if offer_id == "PRE_002":
+        # Unique smartphone référencé pour cette offre dans le catalogue mock :
+        # statut recommandé propre à PRE_002, sans changer ALTERNATIVE pour PRE_001.
+        compatible_devices = [
+            {**device, "compatibility_tag": "RECOMMENDED"}
+            if device["device_id"] == "DEV_102" else device
+            for device in compatible_devices
+        ]
 
     if category_preference is not None:
         compatible_devices = [

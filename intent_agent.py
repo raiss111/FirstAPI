@@ -1,11 +1,14 @@
 import json
+import re
+from typing import Any
 
 from groq import Groq
 
 MODEL = "openai/gpt-oss-20b"
 
-# Intents TOBi définis par le cahier des charges NLU.
-# Ils remplacent les anciens intents banque / crédit.
+# -----------------------------------------------------------------------------
+# Catalogue d'intentions
+# -----------------------------------------------------------------------------
 TOBI_INTENTS = (
     "explain_tariff_plan",
     "topup_airtime",
@@ -13,7 +16,6 @@ TOBI_INTENTS = (
     "handover_human",
 )
 
-# Seuls ces intents sont autorisés à entrer dans l'Agent de Recommandation.
 RECOMMENDATION_INTENTS = (
     "BUY_PREPAID",
     "ASK_RECOMMENDATION",
@@ -23,199 +25,218 @@ RECOMMENDATION_INTENTS = (
 
 FALLBACK_INTENT = "unknown"
 
-INTENTS = (
-    *TOBI_INTENTS,
-    *RECOMMENDATION_INTENTS,
-    FALLBACK_INTENT,
-)
+INTENTS = TOBI_INTENTS + RECOMMENDATION_INTENTS + (FALLBACK_INTENT,)
 
-SYSTEM_PROMPT = """
-Tu es l'Agent Intent Recognition général d'un chatbot TOBi.
 
-Ta seule mission est de classifier le message utilisateur dans exactement UNE
-intention parmi les intentions autorisées ci-dessous.
+INTENT_SYSTEM_PROMPT = """
+Tu es l'Agent Intent / NLU de TOBi.
 
-INTENTIONS TOBi :
-- explain_tariff_plan : l'utilisateur veut comprendre son plan tarifaire actuel,
-  ses avantages ou ses options.
-- topup_airtime : l'utilisateur veut acheter ou recharger du crédit d'appel
-  (Airtime), pour lui-même ou pour un tiers.
-- check_airtime_balance : l'utilisateur veut consulter son solde Airtime.
-- handover_human : l'utilisateur veut être transféré ou parler à un conseiller
-  humain, par chat ou par appel.
+Ton rôle est uniquement de comprendre la demande utilisateur et de retourner
+UNE intention parmi la liste autorisée.
 
-INTENTIONS DU MODULE DE RECOMMANDATION TÉLÉCOM :
-- BUY_PREPAID : l'utilisateur veut voir, acheter ou rechercher une offre / un forfait prépayé.
-- ASK_RECOMMENDATION : l'utilisateur demande une recommandation d'offre parmi les
-  offres disponibles dans son contexte, ou demande pourquoi une recommandation précédente
-  lui a été faite.
-- RECOMMEND_DEVICE : l'utilisateur demande un téléphone, smartphone, routeur ou appareil
-  compatible avec une offre, y compris lorsqu'il dit "avec ça".
-- SUMMARIZE : l'utilisateur demande explicitement un résumé de la conversation, des choix
-  ou des recommandations précédentes.
+Tu dois comprendre la langue de l'utilisateur, quelle qu'elle soit, ainsi que
+les formulations courtes ou contextuelles lorsque l'historique est fourni.
 
-FALLBACK EXISTANT :
-- unknown : aucune des intentions précédentes ne correspond clairement.
+Intentions TOBi :
+- explain_tariff_plan : expliquer le plan tarifaire actuel ou un plan nommé.
+- topup_airtime : acheter/recharger du crédit d'appel (Airtime).
+- check_airtime_balance : consulter le solde Airtime.
+- handover_human : demander un conseiller humain par chat ou appel.
 
-Règles de classification :
-- Choisis exactement une seule intention parmi cette liste.
-- N'invente jamais une autre intention.
-- Ne réponds pas au besoin métier : classe uniquement l'intention.
-- Les intentions TOBi et les intentions du module de recommandation doivent rester distinctes.
-- Utilise topup_airtime uniquement si l'utilisateur exprime clairement l'achat ou la recharge de crédit d'appel / Airtime / unités téléphoniques.
-- Un dépôt M-Pesa, un retrait, un transfert d'argent ou une demande générique de dépôt n'est PAS un topup Airtime.
-- La simple mention de M-Pesa ne suffit jamais à choisir topup_airtime.
-- Exemple : "comment faire un dépôt ?" doit rester unknown avec le fallback actuel.
-- Si l'utilisateur demande son solde Airtime, utilise check_airtime_balance.
-- Si l'utilisateur demande un conseiller humain, utilise handover_human.
-- Si l'utilisateur demande une offre prépayée, utilise BUY_PREPAID.
-- Si l'utilisateur demande "pourquoi cette recommandation ?", "pourquoi tu me recommandes ça ?"
-  ou demande la raison d'une recommandation précédente, utilise ASK_RECOMMENDATION.
-- Si l'utilisateur demande quel appareil est compatible avec une offre, utilise RECOMMEND_DEVICE.
-- Le fallback avancé du cahier des charges n'est pas encore implémenté : conserve unknown
-  pour les demandes non reconnues.
+Intentions de recommandation :
+- BUY_PREPAID : rechercher/consulter une offre prépayée OU exprimer une demande
+  explicite d'achat de forfait prépayé. La distinction est portée par
+  purchase_action et non par une nouvelle intention.
+- ASK_RECOMMENDATION : demander quelle OFFRE/FORFAIT est recommandée, une
+  précision ou une alternative à une offre discutée précédemment.
+- RECOMMEND_DEVICE : demander un TÉLÉPHONE/SMARTPHONE/APPAREIL compatible ou
+  adapté à une offre, même si la phrase dit simplement "tu recommandes quoi ?".
+  Exemple : "Pour mon forfait de 5 Go, quel smartphone me recommandes-tu ?"
+  => RECOMMEND_DEVICE, recommendation_target=device, JAMAIS ASK_RECOMMENDATION.
+  À l'inverse, "quel forfait conseilles-tu pour mon smartphone ?"
+  => ASK_RECOMMENDATION, recommendation_target=offer.
+- SUMMARIZE : demander un résumé de la conversation ou des choix.
+
+Fallback existant :
+- unknown : aucune intention ci-dessus ne correspond suffisamment à la demande.
+
+Règles importantes :
+- Ne transforme pas un dépôt, retrait ou transfert M-Pesa générique en
+  topup_airtime.
+- Le message ACTUEL prime sur l'historique : une ancienne demande d'achat
+  ne doit pas transformer une nouvelle question sur un téléphone en achat ou
+  en recommandation de forfait.
+- recommendation_target représente l'OBJET demandé au tour actuel :
+  device si l'utilisateur veut un appareil/téléphone, offer s'il veut une
+  offre/forfait, none si ni l'un ni l'autre. Comprends-le sémantiquement dans
+  toutes les langues ; ne te limite pas à des mots-clés français.
+- N'utilise pas unknown lorsqu'un message court peut être compris grâce à
+  l'historique fourni.
+- Si BUY_PREPAID correspond à une demande explicite d'acheter, mets
+  purchase_action=request. Pour une recherche/consultation explicite sans
+  volonté d'acheter, mets purchase_action=browse.
+- Mets purchase_action=none seulement si la formulation n'indique ni nouvel
+  achat, ni consultation, ni confirmation/annulation claire.
+- Si PENDING_PURCHASE est actif et le message confirme clairement cet achat
+  simulé, mets intent=BUY_PREPAID et purchase_action=confirm.
+- Si l'utilisateur annule clairement l'achat en attente, mets
+  intent=BUY_PREPAID et purchase_action=cancel.
+- Une confirmation sans achat en attente ne doit jamais être transformée
+  artificiellement en demande d'achat.
+- beneficiary_name est UNIQUEMENT le prénom/nom du bénéficiaire de l'achat
+  prépayé explicitement présent dans le message ; sinon null. N'invente rien.
+- Ne génère aucune réponse utilisateur, ne recommande rien et n'exécute rien.
+- Retourne uniquement l'objet JSON demandé.
 """.strip()
 
-INTENT_SCHEMA = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "intent_classification",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "intent": {
-                    "type": "string",
-                    "enum": list(INTENTS),
-                }
-            },
-            "required": ["intent"],
-            "additionalProperties": False,
-        },
-    },
-}
+
+ENTITY_SYSTEM_PROMPT = """
+Tu es un extracteur d'entités métier pour TOBi.
+
+Comprends la langue de l'utilisateur et le contexte conversationnel fourni.
+N'invente aucune valeur qui n'est pas explicitement présente ou clairement
+implicite dans le message/contexte.
+
+Entités possibles :
+- beneficiary_type : self | other
+- target_msisdn : numéro de téléphone fourni par l'utilisateur
+- amount : montant numérique
+- currency : USD | CDF
+- payment_method : mpesa | airtime | card
+- preferred_channel : chat | call
+- plan_name : nom du plan tarifaire mentionné
+
+Règles :
+- Si le message indique clairement que la recharge est pour un tiers, mets
+  beneficiary_type=other.
+- Si le message indique clairement qu'elle est pour l'utilisateur connecté,
+  mets beneficiary_type=self.
+- Si ce n'est pas déterminable, laisse beneficiary_type à null.
+- Ne déduis pas target_msisdn si aucun numéro n'est fourni.
+- Pour topup_airtime, payment_method sera complété par le backend avec mpesa si
+  aucune méthode n'est fournie ; ne l'invente donc pas ici.
+- Ne génère aucune réponse destinée à l'utilisateur.
+""".strip()
+
+
+# -----------------------------------------------------------------------------
+# Helpers généraux
+# -----------------------------------------------------------------------------
+def _history_to_text(history: list[dict[str, Any]] | None, limit: int = 8) -> str:
+    if not history:
+        return "Aucun historique pertinent."
+
+    lines: list[str] = []
+    for item in history[-limit:]:
+        role = str(item.get("role", "unknown"))
+        content = str(item.get("content", ""))
+        lines.append(f"{role}: {content}")
+
+    return "\n".join(lines)
 
 
 def get_intent_scope(intent: str) -> str:
-    """Retourne le périmètre fonctionnel correspondant à l'intention."""
-    if intent in RECOMMENDATION_INTENTS:
-        return "recommendation"
-
     if intent in TOBI_INTENTS:
         return "tobi"
-
+    if intent in RECOMMENDATION_INTENTS:
+        return "recommendation"
     return "unknown"
 
 
+# -----------------------------------------------------------------------------
+# Classification d'intention via LLM
+# -----------------------------------------------------------------------------
+def classify_intent(
+    client: Groq,
+    user_message: str,
+    history: list[dict[str, Any]] | None = None,
+    pending_purchase: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Comprend l'intention et, pour BUY_PREPAID, le sens transactionnel.
 
-def _apply_intent_guardrails(intent: str, user_message: str) -> str:
+    purchase_action est un signal NLU et ne déclenche jamais une action à lui seul.
+    L'orchestrateur exige aussi un achat en attente avant toute confirmation.
     """
-    Corrige uniquement les confusions métier évidentes entre Airtime et
-    opérations M-Pesa génériques.
-
-    Ce garde-fou ne met PAS en place le fallback avancé du cahier des charges :
-    il réutilise simplement notre fallback existant ``unknown`` lorsqu'une
-    requête ne correspond pas réellement à ``topup_airtime``.
-    """
-    if intent != "topup_airtime":
-        return intent
-
-    text = user_message.lower()
-
-    airtime_markers = (
-        "airtime",
-        "crédit d'appel",
-        "credit d'appel",
-        "crédit appel",
-        "credit appel",
-        "unités",
-        "unites",
-        "recharge de crédit",
-        "recharge du crédit",
-        "recharger du crédit",
-        "recharger le crédit",
-        "acheter du crédit",
-        "acheter des unités",
-        "acheter les unités",
-    )
-
-    non_airtime_money_actions = (
-        "dépôt",
-        "depot",
-        "retirer",
-        "retrait",
-        "transfert",
-        "transférer",
-        "transferer",
-        "envoyer de l'argent",
-        "envoyer argent",
-    )
-
-    has_airtime_marker = any(marker in text for marker in airtime_markers)
-    has_non_airtime_action = any(
-        marker in text for marker in non_airtime_money_actions
-    )
-
-    if has_non_airtime_action and not has_airtime_marker:
-        return FALLBACK_INTENT
-
-    return intent
-
-def classify_intent(client: Groq, user_message: str) -> dict[str, str]:
-    message = user_message.strip()
-
+    message = (user_message or "").strip()
     if not message:
         return {"intent": FALLBACK_INTENT}
+
+    history_text = _history_to_text(history)
+    purchase_context = json.dumps(pending_purchase, ensure_ascii=False) if pending_purchase else "AUCUN"
 
     response = client.chat.completions.create(
         model=MODEL,
         messages=[
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT,
-            },
+            {"role": "system", "content": INTENT_SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": message,
+                "content": (
+                    "Historique de conversation :\n"
+                    f"{history_text}\n\n"
+                    "PENDING_PURCHASE (achat simulé à confirmer, ou AUCUN) :\n"
+                    f"{purchase_context}\n\n"
+                    "Message actuel :\n"
+                    f"{message}"
+                ),
             },
         ],
-        response_format=INTENT_SCHEMA,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "intent_classification",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "intent": {"type": "string", "enum": list(INTENTS)},
+                        "purchase_action": {
+                            "type": "string",
+                            "enum": ["none", "browse", "request", "confirm", "cancel"],
+                        },
+                        "beneficiary_name": {"type": ["string", "null"]},
+                        "recommendation_target": {
+                            "type": "string",
+                            "enum": ["offer", "device", "none"],
+                        },
+                    },
+                    "required": ["intent", "purchase_action", "beneficiary_name", "recommendation_target"],
+                    "additionalProperties": False,
+                },
+            },
+        },
     )
 
-    content = response.choices[0].message.content
-    if not content:
-        return {"intent": FALLBACK_INTENT}
-
-    result = json.loads(content)
-    intent = result.get("intent")
-
+    raw = response.choices[0].message.content or "{}"
+    data = json.loads(raw)
+    intent = data.get("intent", FALLBACK_INTENT)
     if intent not in INTENTS:
-        return {"intent": FALLBACK_INTENT}
+        intent = FALLBACK_INTENT
 
-    intent = _apply_intent_guardrails(intent, message)
-    return {"intent": intent}
+    # Cohérence entre les deux signaux sémantiques renvoyés dans le MÊME appel
+    # LLM : l'objet demandé prime sur le verbe générique "recommander". Il ne
+    # s'agit pas d'une liste de mots-clés ni d'une nouvelle décision du LLM de
+    # réponse. Les intents TOBi, SUMMARIZE et les achats explicites sont intacts.
+    target = data.get("recommendation_target")
+    if target == "device" and intent in {"ASK_RECOMMENDATION", "unknown"}:
+        intent = "RECOMMEND_DEVICE"
 
-# ---------------------------------------------------------------------------
-# Extraction d'entités TOBi - étape 2 du cahier des charges.
-# Cette logique est volontairement séparée du fallback avancé et des scores de
-# confiance, qui seront traités dans une étape dédiée.
-# ---------------------------------------------------------------------------
-
-import re
-from typing import Any
-
-
-TOBI_ENTITY_NAMES = (
-    "beneficiary_type",
-    "target_msisdn",
-    "amount",
-    "currency",
-    "payment_method",
-    "preferred_channel",
-    "plan_name",
-)
+    result: dict[str, Any] = {"intent": intent}
+    if intent == "BUY_PREPAID":
+        action = data.get("purchase_action", "none")
+        if action not in {"none", "browse", "request", "confirm", "cancel"}:
+            action = "none"
+        # Une confirmation hors d'un achat en attente ne vaut jamais achat.
+        if action in {"confirm", "cancel"} and not pending_purchase:
+            action = "none"
+        name = data.get("beneficiary_name")
+        name = name.strip()[:100] if isinstance(name, str) and name.strip() else None
+        result.update({"purchase_action": action, "beneficiary_name": name})
+    return result
 
 
+# -----------------------------------------------------------------------------
+# Extraction / validation déterministe des valeurs structurées
+# -----------------------------------------------------------------------------
 def _normalize_msisdn(value: str) -> str | None:
     """Normalise un numéro Vodacom local 081/082 vers le format +243."""
     compact = re.sub(r"[\s\-()]", "", value)
@@ -230,9 +251,10 @@ def _normalize_msisdn(value: str) -> str | None:
 
 
 def _extract_target_msisdn(message: str) -> str | None:
+    compact_message = re.sub(r"[\s\-()]", "", message)
     candidates = re.findall(
         r"(?:\+243(?:81|82)\d{7}|0(?:81|82)\d{7})",
-        re.sub(r"[\s\-()]", "", message),
+        compact_message,
     )
 
     if not candidates:
@@ -241,10 +263,11 @@ def _extract_target_msisdn(message: str) -> str | None:
     return _normalize_msisdn(candidates[0])
 
 
-def _extract_amount_and_currency(message: str) -> tuple[float | int | None, str | None]:
+def _extract_amount_and_currency(
+    message: str,
+) -> tuple[float | int | None, str | None]:
     text = message.lower().replace(",", ".")
 
-    # Exemples couverts : 5$, 5 USD, 5000 CDF, 5000 francs.
     patterns = (
         (r"(?P<amount>\d+(?:\.\d+)?)\s*\$", "USD"),
         (r"(?P<amount>\d+(?:\.\d+)?)\s*(?:usd|dollars?)\b", "USD"),
@@ -262,204 +285,249 @@ def _extract_amount_and_currency(message: str) -> tuple[float | int | None, str 
     return None, None
 
 
+def _resolve_beneficiary_type(
+    extracted_beneficiary_type: str | None,
+    target_msisdn: str | None,
+) -> str | None:
+    """
+    Applique uniquement une règle métier vérifiable.
 
-
-def _extract_beneficiary_type(message: str, target_msisdn: str | None) -> str:
-    """Déduit si la recharge est pour soi-même ou pour un tiers."""
-    text = message.lower()
-
-    other_markers = (
-        "pour quelqu'un",
-        "pour quelqu’un",
-        "pour un tiers",
-        "pour une autre personne",
-        "pour un autre numéro",
-        "pour un autre numero",
-        "pour mon frère",
-        "pour mon frere",
-        "pour ma soeur",
-        "pour ma mère",
-        "pour ma mere",
-        "pour mon père",
-        "pour mon pere",
-        "pour mon ami",
-        "pour mon amie",
-    )
-
-    self_markers = (
-        "pour moi",
-        "pour moi-même",
-        "pour moi meme",
-        "sur mon numéro",
-        "sur mon numero",
-        "ma ligne",
-    )
-
-    if target_msisdn or any(marker in text for marker in other_markers):
+    La compréhension linguistique de self/other appartient au LLM.
+    Si un numéro cible explicite est fourni, on sait en revanche qu'il s'agit
+    d'un tiers pour ce workflow.
+    """
+    if target_msisdn:
         return "other"
 
-    if any(marker in text for marker in self_markers):
-        return "self"
-
-    # Pour le Top Up, l'absence d'indication contraire signifie la ligne connectée.
-    return "self"
-
-
-def _extract_payment_method(message: str) -> str | None:
-    text = message.lower()
-
-    if "m-pesa" in text or "mpesa" in text or "m pesa" in text:
-        return "mpesa"
-
-    if "carte" in text or "card" in text:
-        return "card"
-
-    if "airtime" in text or "crédit d'appel" in text or "credit d'appel" in text:
-        return "airtime"
+    if extracted_beneficiary_type in {"self", "other"}:
+        return extracted_beneficiary_type
 
     return None
 
 
-def _extract_preferred_channel(message: str) -> str | None:
-    text = message.lower()
+# -----------------------------------------------------------------------------
+# Extraction sémantique des entités via LLM
+# -----------------------------------------------------------------------------
+def _extract_entities_with_llm(
+    client: Groq,
+    intent: str,
+    message: str,
+    history: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    history_text = _history_to_text(history)
 
-    if re.search(r"\bchat\b", text):
-        return "chat"
-
-    if re.search(r"\b(?:call|appel|appeler|téléphone|telephone)\b", text):
-        return "call"
-
-    return None
-
-
-def _extract_plan_name(message: str) -> str | None:
-    """Extraction prudente d'un nom de plan explicite ; le champ reste optionnel."""
-    patterns = (
-        r"(?:plan|offre|forfait)\s+(?:tarifaire\s+)?[\"']?([A-Za-z0-9][A-Za-z0-9 _\-]{1,40})[\"']?",
-        r"[\"']([^\"']{2,40})[\"']\s+(?:plan|offre|forfait)",
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": ENTITY_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Intent déjà identifié : {intent}\n\n"
+                    "Historique de conversation :\n"
+                    f"{history_text}\n\n"
+                    "Message actuel :\n"
+                    f"{message}\n\n"
+                    "Retourne exactement un objet JSON avec ces clés :\n"
+                    "beneficiary_type, target_msisdn, amount, currency, "
+                    "payment_method, preferred_channel, plan_name.\n"
+                    "Utilise null pour toute valeur absente ou indéterminable."
+                ),
+            },
+        ],
+        response_format={"type": "json_object"},
     )
 
-    for pattern in patterns:
-        match = re.search(pattern, message, flags=re.IGNORECASE)
-        if match:
-            value = match.group(1).strip(" .?!,;:")
-            # Évite de prendre une phrase générique entière comme nom de plan.
-            if 1 <= len(value.split()) <= 5:
-                return value
+    raw = response.choices[0].message.content or "{}"
+    data = json.loads(raw)
 
-    return None
-
-
-def extract_tobi_entities(intent: str, user_message: str) -> dict[str, Any]:
-    """
-    Extrait les entités métier du cahier des charges pour une intention TOBi.
-
-    Retourne :
-    - entities : dictionnaire normalisé des valeurs trouvées/déduites ;
-    - slots_complete : indique si les données nécessaires au workflow sont présentes.
-
-    Cette étape ne gère volontairement ni les scores de confiance ni le fallback
-    avancé du cahier des charges.
-    """
-    message = user_message.strip()
-    entities: dict[str, Any] = {}
-
-    if intent == "topup_airtime":
-        target_msisdn = _extract_target_msisdn(message)
-        amount, currency = _extract_amount_and_currency(message)
-        payment_method = _extract_payment_method(message) or "mpesa"
-
-        beneficiary_type = _extract_beneficiary_type(message, target_msisdn)
-
-        entities["beneficiary_type"] = beneficiary_type
-
-        if target_msisdn:
-            entities["target_msisdn"] = target_msisdn
-
-        if amount is not None:
-            entities["amount"] = amount
-
-        if currency is not None:
-            entities["currency"] = currency
-
-        entities["payment_method"] = payment_method
-
-        required_complete = amount is not None and currency is not None
-        if beneficiary_type == "other":
-            required_complete = required_complete and target_msisdn is not None
-
-        return {
-            "entities": entities,
-            "slots_complete": required_complete,
-        }
-
-    if intent == "handover_human":
-        preferred_channel = _extract_preferred_channel(message)
-
-        if preferred_channel:
-            entities["preferred_channel"] = preferred_channel
-
-        return {
-            "entities": entities,
-            "slots_complete": preferred_channel is not None,
-        }
-
-    if intent == "explain_tariff_plan":
-        plan_name = _extract_plan_name(message)
-        if plan_name:
-            entities["plan_name"] = plan_name
-
-        # plan_name est optionnel dans le cahier des charges.
-        return {
-            "entities": entities,
-            "slots_complete": True,
-        }
-
-    if intent == "check_airtime_balance":
-        # Aucune entité requise par le cahier des charges.
-        return {
-            "entities": {},
-            "slots_complete": True,
-        }
-
-    # Les intents de recommandation et notre fallback existant ne sont pas
-    # modifiés par cette étape.
+    # On ne laisse passer que les clés attendues.
     return {
-        "entities": {},
-        "slots_complete": True,
+        "beneficiary_type": data.get("beneficiary_type"),
+        "target_msisdn": data.get("target_msisdn"),
+        "amount": data.get("amount"),
+        "currency": data.get("currency"),
+        "payment_method": data.get("payment_method"),
+        "preferred_channel": data.get("preferred_channel"),
+        "plan_name": data.get("plan_name"),
     }
 
 
-def analyze_nlu_request(client: Groq, user_message: str) -> dict[str, Any]:
+def extract_tobi_entities(
+    client: Groq,
+    intent: str,
+    message: str,
+    history: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """
-    Exécute le pipeline NLU actuel :
-    1. classification de l'intention ;
-    2. extraction des entités TOBi ;
-    3. calcul de slots_complete ;
-    4. normalisation dans une structure JSON proche du contrat TOBi.
+    Extrait les entités TOBi avec le LLM puis valide/normalise les valeurs
+    structurées avec des règles déterministes.
+    """
+    if intent not in TOBI_INTENTS:
+        return {
+            "entities": {},
+            "missing_slots": [],
+            "slots_complete": True,
+        }
 
-    Les scores de confiance et le fallback avancé ne sont volontairement
-    pas encore gérés à cette étape.
-    """
-    query = user_message.strip()
-    classification = classify_intent(client, query)
+    llm_entities = _extract_entities_with_llm(
+        client=client,
+        intent=intent,
+        message=message,
+        history=history,
+    )
+
+    entities: dict[str, Any] = {}
+
+    # Numéro : extraction/validation déterministe prioritaire.
+    deterministic_msisdn = _extract_target_msisdn(message)
+    llm_msisdn = llm_entities.get("target_msisdn")
+    normalized_llm_msisdn = (
+        _normalize_msisdn(str(llm_msisdn)) if llm_msisdn else None
+    )
+    target_msisdn = deterministic_msisdn or normalized_llm_msisdn
+
+    # Montant + devise : extraction déterministe prioritaire si présents.
+    deterministic_amount, deterministic_currency = _extract_amount_and_currency(message)
+
+    amount = deterministic_amount
+    currency = deterministic_currency
+
+    if amount is None:
+        llm_amount = llm_entities.get("amount")
+        if isinstance(llm_amount, (int, float)):
+            amount = llm_amount
+        elif isinstance(llm_amount, str):
+            try:
+                amount = float(llm_amount.replace(",", "."))
+                if amount.is_integer():
+                    amount = int(amount)
+            except ValueError:
+                amount = None
+
+    if currency is None:
+        llm_currency = str(llm_entities.get("currency") or "").upper()
+        if llm_currency in {"USD", "CDF"}:
+            currency = llm_currency
+
+    beneficiary_type = _resolve_beneficiary_type(
+        extracted_beneficiary_type=llm_entities.get("beneficiary_type"),
+        target_msisdn=target_msisdn,
+    )
+
+    payment_method = str(llm_entities.get("payment_method") or "").lower()
+    if payment_method not in {"mpesa", "airtime", "card"}:
+        payment_method = None
+
+    preferred_channel = str(llm_entities.get("preferred_channel") or "").lower()
+    if preferred_channel not in {"chat", "call"}:
+        preferred_channel = None
+
+    plan_name = llm_entities.get("plan_name")
+    if isinstance(plan_name, str):
+        plan_name = plan_name.strip() or None
+    else:
+        plan_name = None
+
+    # Construction des entities pertinentes.
+    if intent == "topup_airtime":
+        if beneficiary_type is not None:
+            entities["beneficiary_type"] = beneficiary_type
+        if target_msisdn is not None:
+            entities["target_msisdn"] = target_msisdn
+        if amount is not None:
+            entities["amount"] = amount
+        if currency is not None:
+            entities["currency"] = currency
+
+        # Le cahier des charges prévoit mpesa comme valeur par défaut du Top Up.
+        entities["payment_method"] = payment_method or "mpesa"
+
+    elif intent == "handover_human":
+        if preferred_channel is not None:
+            entities["preferred_channel"] = preferred_channel
+
+    elif intent == "explain_tariff_plan":
+        if plan_name is not None:
+            entities["plan_name"] = plan_name
+
+    # check_airtime_balance n'a pas d'entité obligatoire.
+
+    missing_slots = _get_missing_slots(intent, entities)
+
+    return {
+        "entities": entities,
+        "missing_slots": missing_slots,
+        "slots_complete": len(missing_slots) == 0,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Slot filling
+# -----------------------------------------------------------------------------
+def _get_missing_slots(intent: str, entities: dict[str, Any]) -> list[str]:
+    if intent == "topup_airtime":
+        required = [
+            "beneficiary_type",
+            "amount",
+            "currency",
+            "payment_method",
+        ]
+
+        missing = [name for name in required if entities.get(name) in {None, ""}]
+
+        if entities.get("beneficiary_type") == "other" and not entities.get("target_msisdn"):
+            missing.append("target_msisdn")
+
+        return missing
+
+    if intent == "handover_human":
+        return [] if entities.get("preferred_channel") else ["preferred_channel"]
+
+    # explain_tariff_plan : plan_name optionnel
+    # check_airtime_balance : aucune entité requise
+    return []
+
+
+# -----------------------------------------------------------------------------
+# Pipeline NLU normalisé
+# -----------------------------------------------------------------------------
+def analyze_nlu_request(
+    client: Groq,
+    query: str,
+    history: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    classification = classify_intent(
+        client=client,
+        user_message=query,
+        history=history,
+    )
     intent = classification["intent"]
 
-    extraction = extract_tobi_entities(intent, query)
+    if intent in TOBI_INTENTS:
+        extraction = extract_tobi_entities(
+            client=client,
+            intent=intent,
+            message=query,
+            history=history,
+        )
+        entities_dict = extraction["entities"]
+        missing_slots = extraction["missing_slots"]
+        slots_complete = extraction["slots_complete"]
+    else:
+        entities_dict = {}
+        missing_slots = []
+        slots_complete = True
 
-    entities = [
-        {
-            "entity": entity_name,
-            "value": value,
-        }
-        for entity_name, value in extraction["entities"].items()
+    entities_list = [
+        {"entity": name, "value": value}
+        for name, value in entities_dict.items()
     ]
 
     return {
         "query": query,
-        "intent": {
-            "name": intent,
-        },
-        "entities": entities,
-        "slots_complete": extraction["slots_complete"],
+        "intent": {"name": intent},
+        "entities": entities_list,
+        "missing_slots": missing_slots,
+        "slots_complete": slots_complete,
     }

@@ -1,4 +1,3 @@
-from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from nodes import (
@@ -55,15 +54,14 @@ builder.add_conditional_edges(
     },
 )
 
-# L'Agent de Recommandation termine après avoir produit les données métier.
-# Il ne construit aucune réponse utilisateur.
+# L'Agent de Recommandation produit uniquement des données métier.
 builder.add_edge("get_offers", END)
 builder.add_edge("get_devices", END)
 builder.add_edge("recommend_offer", END)
 builder.add_edge("summary", END)
 
-memory = InMemorySaver()
-
-recommendation_graph = builder.compile(
-    checkpointer=memory,
-)
+# IMPORTANT MVP : pas de checkpointer LangGraph ici.
+# La mémoire conversationnelle unique appartient à l'orchestrateur
+# (communication_agent.py). Le graphe reçoit à chaque appel le contexte de
+# recommandation déjà mémorisé par cet orchestrateur.
+recommendation_graph = builder.compile()

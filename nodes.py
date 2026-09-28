@@ -93,9 +93,15 @@ def extract_context_node(state: AgentState):
         updates["initial_intent"] = intent
 
     if "flexi data max" in message_lower or "flexi data" in message_lower:
+        # Un plan nommé explicitement prime sur un vieux budget hérité : la
+        # personne peut changer d'offre au milieu d'une même conversation.
+        updates["budget"] = None
+        updates["requested_data_gb"] = None
         updates["selected_offer_id"] = "PRE_001"
         updates["selected_offer_name"] = "Flexi Data Max"
     elif "eco prepaid" in message_lower:
+        updates["budget"] = None
+        updates["requested_data_gb"] = None
         updates["selected_offer_id"] = "PRE_002"
         updates["selected_offer_name"] = "Eco Prepaid"
 
@@ -121,86 +127,204 @@ def extract_context_node(state: AgentState):
     return updates
 
 
-def get_offers_node(state: AgentState):
-    offers = get_prepaid_offers_mock.invoke(
-        {
-            "user_budget_max": state.get("budget"),
-        }
-    )
+def _select_offer_from_results(
+    state: AgentState,
+    offers: list[dict],
+    *,
+    is_recommendation: bool,
+) -> tuple[dict | None, str]:
+    """Une seule règle métier de sélection, utilisée par les deux branches offre.
 
-    offers = _filter_offers_by_data(
-        offers,
-        state.get("requested_data_gb"),
-    )
+    Un nouveau montant explicite prime sur une ancienne sélection. L'absence de
+    nouveaux critères conserve la sélection précédente *seulement si elle reste
+    éligible*. Le graph choisit, jamais le Response LLM.
+    """
+    if not offers:
+        return None, "no_eligible_offer"
 
-    updates = {
-        "offers": offers,
-        # Une recherche d'offre ne doit pas laisser traîner les appareils
-        # d'une ancienne recommandation dans le State visible.
-        "devices": [],
-    }
+    message = state.get("message", "") or ""
+    message_lower = message.lower()
+
+    # Les noms officiels du catalogue sont des références produit, pas des
+    # marqueurs linguistiques de conversation.
+    named_offer = next(
+        (
+            offer
+            for offer in offers
+            if offer["name"].lower() in message_lower
+        ),
+        None,
+    )
+    if named_offer is not None:
+        return named_offer, "explicit_offer_name"
+
+    # Une nouvelle demande chiffrée ne doit pas garder une sélection héritée.
+    mentioned_amount = _extract_budget_amount(message)
+    if mentioned_amount is not None:
+        matching_price = [
+            offer for offer in offers
+            if float(offer["price_monthly"]) == float(mentioned_amount)
+        ]
+        if matching_price:
+            return max(matching_price, key=lambda o: o["data_gb"]), "exact_price"
+        # Si le montant est un plafond sans correspondance exacte, privilégier
+        # l'offre éligible offrant le plus de data (puis le prix le plus élevé).
+        return max(
+            offers,
+            key=lambda o: (float(o["data_gb"]), float(o["price_monthly"])),
+        ), "most_data_within_budget"
+
+    previous_offer = next(
+        (
+            offer for offer in offers
+            if offer["offer_id"] == state.get("selected_offer_id")
+        ),
+        None,
+    )
+    # Une demande explicite de data doit revalider l'offre précédente : si elle
+    # est encore admissible, on la conserve, sinon on recalcule ci-dessous.
+    if previous_offer is not None:
+        return previous_offer, "previous_eligible_selection"
 
     if len(offers) == 1:
-        updates["selected_offer_id"] = offers[0]["offer_id"]
-        updates["selected_offer_name"] = offers[0]["name"]
+        return offers[0], "single_eligible_offer"
 
-    return updates
+    if is_recommendation:
+        return max(
+            offers,
+            key=lambda o: (float(o["data_gb"]), float(o["price_monthly"])),
+        ), "most_data_among_eligible_offers"
+
+    # BUY_PREPAID sans critère discriminant : liste d'offres, pas de sélection
+    # artificielle. Le LLM ne pourra pas inventer une sélection dans le State.
+    return None, "multiple_eligible_offers"
+
+
+def _offer_result(state: AgentState, *, is_recommendation: bool) -> dict:
+    offers = get_prepaid_offers_mock.invoke(
+        {"user_budget_max": state.get("budget")}
+    )
+    offers = _filter_offers_by_data(offers, state.get("requested_data_gb"))
+    selected, basis = _select_offer_from_results(
+        state, offers, is_recommendation=is_recommendation
+    )
+
+    return {
+        "offers": offers,
+        "selected_offer_id": selected["offer_id"] if selected else None,
+        "selected_offer_name": selected["name"] if selected else None,
+        "selection_basis": basis,
+        # Ne pas exposer des appareils d'une recherche précédente.
+        "devices": [],
+        "closest_device": None,
+        "device_budget_gap": None,
+    }
+
+
+def get_offers_node(state: AgentState):
+    """BUY_PREPAID : cherche les offres et choisit seulement si les faits suffisent."""
+    return _offer_result(state, is_recommendation=False)
 
 
 def get_devices_node(state: AgentState):
+    """Cherche d'abord dans le budget, puis calcule l'option compatible la plus proche."""
     offer_id = state.get("selected_offer_id")
+    offer_updates = {}
+
+    # Une référence explicite à un forfait de N Go prime sur une sélection
+    # antérieure : "pour mon forfait de 5 Go" désigne ici PRE_002. On ne
+    # déduit une offre que si UNE SEULE ligne du catalogue correspond exactement.
+    # Sans correspondance unique, on garde le comportement antérieur.
+    mentioned_data_gb = _extract_requested_data_gb(state.get("message", "") or "")
+    if mentioned_data_gb is not None:
+        matching_plans = [
+            offer
+            for offer in get_prepaid_offers_mock.invoke({"user_budget_max": None})
+            if float(offer.get("data_gb", -1)) == mentioned_data_gb
+        ]
+        if len(matching_plans) == 1:
+            plan = matching_plans[0]
+            offer_id = plan["offer_id"]
+            offer_updates = {
+                "selected_offer_id": plan["offer_id"],
+                "selected_offer_name": plan["name"],
+                "selection_basis": "explicit_data_plan",
+                "offers": [plan],
+            }
 
     if not offer_id:
-        return {"devices": []}
+        return {
+            **offer_updates,
+            "devices": [],
+            "closest_device": None,
+            "device_budget_gap": None,
+        }
+
+    category = state.get("category_preference")
+    max_price = state.get("max_price")
 
     devices = get_compatible_devices_mock.invoke(
         {
             "offer_id": offer_id,
-            "category_preference": state.get("category_preference"),
-            "max_price": state.get("max_price"),
+            "category_preference": category,
+            "max_price": max_price,
         }
     )
 
-    return {"devices": devices}
+    if devices:
+        return {
+            **offer_updates,
+            "devices": devices,
+            "closest_device": None,
+            "device_budget_gap": None,
+        }
+
+    # Aucun appareil ne respecte le budget. On récupère alors les appareils
+    # compatibles sans plafond de prix uniquement pour proposer l'option la plus
+    # proche, sans prétendre qu'elle respecte le budget utilisateur.
+    if max_price is not None:
+        compatible_devices = get_compatible_devices_mock.invoke(
+            {
+                "offer_id": offer_id,
+                "category_preference": category,
+                "max_price": None,
+            }
+        )
+
+        priced_devices = [
+            device
+            for device in compatible_devices
+            if device.get("price") is not None
+        ]
+
+        if priced_devices:
+            closest_device = min(
+                priced_devices,
+                key=lambda device: float(device["price"]),
+            )
+            gap = max(
+                0.0,
+                float(closest_device["price"]) - float(max_price),
+            )
+
+            return {
+                **offer_updates,
+                "devices": [],
+                "closest_device": closest_device,
+                "device_budget_gap": gap,
+            }
+
+    return {
+        **offer_updates,
+        "devices": [],
+        "closest_device": None,
+        "device_budget_gap": None,
+    }
 
 
 def recommend_offer_node(state: AgentState):
-    """Choisit une offre parmi celles éligibles, sans recommander d'appareil."""
-    offers = get_prepaid_offers_mock.invoke(
-        {
-            "user_budget_max": state.get("budget"),
-        }
-    )
-
-    offers = _filter_offers_by_data(
-        offers,
-        state.get("requested_data_gb"),
-    )
-
-    if not offers:
-        return {
-            "offers": [],
-            "selected_offer_id": None,
-            "selected_offer_name": None,
-            "devices": [],
-        }
-
-    selected_offer_id = state.get("selected_offer_id")
-    selected_offer = next(
-        (offer for offer in offers if offer["offer_id"] == selected_offer_id),
-        None,
-    )
-
-    # MVP : à budget égal, privilégier l'offre avec le plus de data.
-    if selected_offer is None:
-        selected_offer = max(offers, key=lambda offer: offer["data_gb"])
-
-    return {
-        "offers": offers,
-        "selected_offer_id": selected_offer["offer_id"],
-        "selected_offer_name": selected_offer["name"],
-        "devices": [],
-    }
+    """ASK_RECOMMENDATION : sélection métier parmi les offres éligibles."""
+    return _offer_result(state, is_recommendation=True)
 
 
 def summary_node(state: AgentState):
