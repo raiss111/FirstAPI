@@ -11,12 +11,6 @@ function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-/**
- * Ajoute un message dans le DOM.
- * @param {"user"|"assistant"} role
- * @param {string} text
- * @returns {HTMLElement} la bulle
- */
 function addMessage(role, text = "") {
   const wrapper = document.createElement("div");
   wrapper.className = `message ${role}`;
@@ -45,9 +39,6 @@ function setLoading(loading) {
   if (!loading) input.focus();
 }
 
-// ============================================================
-//  Envoi du message
-// ============================================================
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
 
@@ -79,14 +70,11 @@ form.addEventListener("submit", async (event) => {
       throw new Error(detail);
     }
 
-    // Nouvelle structure ChatResponse :
-    // { customer_id, profile_status, intent, scope, response, state, offers }
+    // ChatResponse = { customer_id, profile_status, intent, scope, response, state, offers }
     const data = await res.json();
 
-    // Remplace le placeholder par la vraie réponse
     bubble.textContent = data.response ?? "(réponse vide)";
 
-    // Logs utiles pour débugger selon le scope
     console.log("Customer :", data.customer_id);
     console.log("Profile  :", data.profile_status);
     console.log("Intent   :", data.intent);
@@ -94,7 +82,7 @@ form.addEventListener("submit", async (event) => {
     console.log("State    :", data.state);
     console.log("Offers   :", data.offers);
 
-    // Rendu enrichi : liste des offres si scope = recommendation
+    // Liste des offres (scope = recommendation)
     if (
       data.scope === "recommendation" &&
       Array.isArray(data.offers) &&
@@ -106,13 +94,13 @@ form.addEventListener("submit", async (event) => {
       list.style.color = "#555";
       data.offers.forEach((offer) => {
         const line = document.createElement("div");
-        line.textContent = `• ${offer.name} — ${offer.price_monthly}$ / mois, ${offer.data_gb} Go`;
+        line.textContent = `• ${offer.name} — ${offer.price_monthly} ${offer.currency || "$"} / mois, ${offer.data_gb} Go`;
         list.appendChild(line);
       });
       bubble.appendChild(list);
     }
 
-    // Rendu enrichi : liste des appareils si scope = recommendation et intent = RECOMMEND_DEVICE
+    // Liste des appareils (intent = RECOMMEND_DEVICE)
     if (
       data.intent === "RECOMMEND_DEVICE" &&
       data.state &&
@@ -125,13 +113,13 @@ form.addEventListener("submit", async (event) => {
       list.style.color = "#555";
       data.state.devices.forEach((device) => {
         const line = document.createElement("div");
-        line.textContent = `• ${device.brand} ${device.model} — ${device.price}$`;
+        line.textContent = `• ${device.brand} ${device.model} — ${device.price} ${device.currency || "$"}`;
         list.appendChild(line);
       });
       bubble.appendChild(list);
     }
 
-    // Rendu enrichi : slots manquants si scope = tobi
+    // Slots TOBi manquants (scope = tobi)
     if (
       data.scope === "tobi" &&
       data.state &&
@@ -146,12 +134,14 @@ form.addEventListener("submit", async (event) => {
       bubble.appendChild(hint);
     }
 
-    // Rendu enrichi : état d'achat simulé en attente de confirmation
-    if (
-      data.state &&
-      data.state.purchase &&
-      data.state.purchase.status === "AWAITING_CONFIRMATION"
-    ) {
+    // Achat simulé en attente de confirmation
+    // Le purchase peut être dans state.purchase (scope recommendation)
+    // ou directement dans state (scope unknown).
+    const purchase =
+      (data.state && data.state.purchase) ||
+      (data.state && data.state.status === "AWAITING_CONFIRMATION" ? data.state : null);
+
+    if (purchase && purchase.status === "AWAITING_CONFIRMATION") {
       const hint = document.createElement("div");
       hint.style.marginTop = "8px";
       hint.style.fontSize = "12px";
@@ -168,5 +158,4 @@ form.addEventListener("submit", async (event) => {
   }
 });
 
-// Focus automatique au chargement
 input.focus();

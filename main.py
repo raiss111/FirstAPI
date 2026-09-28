@@ -4,6 +4,9 @@ from typing import Any
 import groq
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from pathlib import Path
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from groq import Groq
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -89,9 +92,18 @@ app = FastAPI(
 
 client = create_client()
 
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
 
-@app.get("/")
-def root():
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/", include_in_schema=False)
+def front():
+    return FileResponse(STATIC_DIR / "index.html")
+
+@app.get("/api")
+def api_root():
     return {
         "message": "API Agentic AI Vodacom active",
         "conversation_mode": "single_active_conversation_in_memory",
@@ -99,7 +111,7 @@ def root():
             "Gateway -> Communication/Orchestrator -> Intent -> "
             "{TOBi | Recommendation} -> LLM"
         ),
-    }
+    }       
 
 
 @app.get("/health")
