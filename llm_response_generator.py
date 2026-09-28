@@ -37,8 +37,17 @@ PURCHASE-STATE CONTRACT:
   If status=SIMULATED_SUCCESS and real_transaction=false, say explicitly that
   the MOCK/SIMULATED purchase was completed. Never claim a real transaction.
 - If CANCELLED: simply state that the simulated purchase was canceled.
-- If OFFER_UNAVAILABLE: present the real available offers or the absence of a
-  match, without inventing a selection. Do not ask for payment/phone details.
+- If OFFER_UNAVAILABLE: NO offer has been selected; no purchase can be confirmed.
+  recommendation_state.price_match_mode has two distinct meanings:
+  "exact" means the user asked for a plan AT THAT PRICE (e.g. « forfait de
+  40$ »); say that NO plan exists at that exact price, NOT that all cheaper
+  plans are unavailable. "maximum" means a budget CEILING (e.g. « budget
+  maximum de 40$ »); say no plan fits that limit if offers=[]. The amount and
+  its explicitly supplied currency are in budget/budget_currency. You may
+  mention ONLY the facts in recommendation_state.available_offers or
+  lowest_available_offer as clearly labelled OTHER available options, NEVER
+  as the requested plan or a selected plan. Never reuse the previous selection.
+  Never request confirmation, payment or phone details on an unavailable offer.
 - Otherwise: only verbalize the recommendation / TOBi result actually provided.
 - If the current message is ambiguous while confirmation is pending, ask only
   for clarification of confirmation; never execute anything yourself.
@@ -108,8 +117,11 @@ def _numeric_facts(business_context: dict[str, Any]) -> set[float]:
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             values.add(float(value))
     products = list(rec.get("offers") or []) + list(rec.get("devices") or [])
+    products.extend(rec.get("available_offers") or [])
     if rec.get("closest_device"):
         products.append(rec["closest_device"])
+    if rec.get("lowest_available_offer"):
+        products.append(rec["lowest_available_offer"])
     if (business_context.get("purchase_state") or {}).get("offer"):
         products.append(business_context["purchase_state"]["offer"])
     for product in products:
@@ -142,14 +154,48 @@ def _validate_recommendation_response(
 
     if scope == "recommendation" or purchase.get("status"):
         products = list(rec.get("offers") or []) + list(rec.get("devices") or [])
+        products.extend(rec.get("available_offers") or [])
         if rec.get("closest_device"):
             products.append(rec["closest_device"])
+        if rec.get("lowest_available_offer"):
+            products.append(rec["lowest_available_offer"])
         if purchase.get("offer"):
             products.append(purchase["offer"])
         allowed_currencies = {
             str(item["currency"]).upper()
             for item in products if item.get("currency")
         }
+        # Le budget du client est aussi un fait métier. Quand aucune offre ne
+        # passe le filtre, ne pas rejeter son « 2 USD » comme une devise inventée.
+        # En revanche, un ancien budget sans unité n'autorise aucune déduction.
+        budget_currency = str(rec.get("budget_currency") or "").upper()
+        if isinstance(rec.get("budget"), (int, float)) and budget_currency in _CURRENCY_MARKERS:
+            allowed_currencies.add(budget_currency)
+
+        # Les prix exprimés avec une devise doivent correspondre à une paire
+        # (montant, devise) réelle, et non à un volume data ou un ancien budget.
+        allowed_money = {
+            (float(item[key]), str(item.get("currency", "")).upper())
+            for item in products for key in ("price_monthly", "price")
+            if isinstance(item.get(key), (int, float)) and item.get("currency")
+        }
+        if budget_currency in _CURRENCY_MARKERS and isinstance(rec.get("budget"), (int, float)):
+            allowed_money.add((float(rec["budget"]), budget_currency))
+        token_currency = {"$": "USD", "€": "EUR", "£": "GBP", "USD": "USD", "EUR": "EUR", "CDF": "CDF", "GBP": "GBP", "FC": "CDF"}
+        amount = r"(\d+(?:[.,]\d+)?)"
+        money_suffix = re.compile(rf"(?<!\w){amount}\s*(\$|€|£|USD\b|EUR\b|CDF\b|GBP\b|FC\b)", re.I)
+        money_prefix = re.compile(rf"(?<!\w)(\$|€|£|USD\b|EUR\b|CDF\b|GBP\b|FC\b)\s*{amount}", re.I)
+        for match in money_suffix.finditer(response_text):
+            pair = (float(match.group(1).replace(",", ".")), token_currency[match.group(2).upper()])
+            if pair not in allowed_money:
+                issues.append("unsupported_price_currency_pair")
+                break
+        for match in money_prefix.finditer(response_text):
+            pair = (float(match.group(2).replace(",", ".")), token_currency[match.group(1).upper()])
+            if pair not in allowed_money:
+                issues.append("unsupported_price_currency_pair")
+                break
+
         for currency, pattern in _CURRENCY_MARKERS.items():
             if currency not in allowed_currencies and re.search(pattern, response_text, re.I):
                 issues.append(f"unsupported_currency:{currency}")
@@ -181,7 +227,30 @@ def _validate_recommendation_response(
         ):
             issues.append("device_result_not_mentioned")
 
+        # La présence du Xiaomi correct ne doit pas suffire à autoriser l'ajout
+        # d'un Samsung non renvoyé. Le catalogue de contrôle n'est pas visible
+        # du LLM et n'autorise aucune sélection supplémentaire.
+        allowed_ids = {device.get("device_id") for device in listed_devices}
+        text_lower = response_text.casefold()
+        for catalog_device in business_context.get("_validation_device_catalog") or []:
+            if catalog_device.get("device_id") in allowed_ids:
+                continue
+            full_name = " ".join((
+                str(catalog_device.get("brand", "")),
+                str(catalog_device.get("model", "")),
+            )).strip().casefold()
+            model = str(catalog_device.get("model", "")).strip().casefold()
+            if (full_name and full_name in text_lower) or (model and model in text_lower):
+                issues.append("unlisted_device_mentioned")
+                break
+
     status = purchase.get("status")
+    if status == "OFFER_UNAVAILABLE":
+        if re.search(
+            r"\b(?:confirmez|confirm(?:ez|ation)?|validez|proceed|checkout)\b",
+            response_text, re.I,
+        ):
+            issues.append("unavailable_offer_confirmation_not_allowed")
     if status != "COMPLETED" and re.search(
         r"\b(?:achat|purchase|commande|order)\b.{0,55}"
         r"\b(?:effectu[eé]|r[eé]alis[eé]|finalis[eé]|completed|successful|done)\b",
@@ -227,6 +296,45 @@ def _normalize_plain_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _no_offer_safe_fallback(business_context: dict[str, Any]) -> str | None:
+    """Dernier recours de disponibilité : verbalise des FAITS déjà calculés.
+
+    Strictement réservé à OFFER_UNAVAILABLE après deux sorties LLM invalides.
+    Aucun choix de produit, nouvelle règle d'achat ou procédure n'est effectué.
+    Ce traitement évite de transformer une absence normale de produit en HTTP 502.
+    """
+    purchase = business_context.get("purchase_state") or {}
+    rec = business_context.get("recommendation_state") or {}
+    if purchase.get("status") != "OFFER_UNAVAILABLE" or rec.get("selected_offer_id"):
+        return None
+    amount = rec.get("budget")
+    currency = rec.get("budget_currency")
+    shown_amount = (
+        f"{amount:g}" if isinstance(amount, (float, int)) and not isinstance(amount, bool)
+        else None
+    )
+    unit = f" {currency}" if currency in {"USD", "CDF"} else ""
+    if rec.get("price_match_mode") == "exact" and shown_amount:
+        lead = f"Aucun forfait au prix exact de {shown_amount}{unit} n'est disponible."
+    elif shown_amount:
+        lead = f"Aucun forfait ne correspond au budget de {shown_amount}{unit}."
+    else:
+        lead = "Aucun forfait ne correspond à cette demande."
+    # Alternatives factuelles uniquement, jamais sélectionnées ni proposées à
+    # la confirmation. Ne pas extrapoler si le catalogue compatible est vide.
+    alternatives = rec.get("available_offers") or []
+    if alternatives:
+        details = ", ".join(
+            f"{offer['name']} à {float(offer['price_monthly']):g} {offer['currency']}"
+            for offer in alternatives
+            if offer.get("name") and isinstance(offer.get("price_monthly"), (float, int))
+            and offer.get("currency")
+        )
+        if details:
+            lead += f" Offres existantes : {details}."
+    return _normalize_plain_text(lead)
+
+
 def generate_user_response(
     client: Groq,
     *,
@@ -234,6 +342,7 @@ def generate_user_response(
     business_context: dict[str, Any],
     history: list[dict[str, str]],
     preferred_language: str | None,
+    validation_device_catalog: list[dict[str, Any]] | None = None,
 ) -> str:
     """Génère un texte naturel à partir du contexte métier ; échoue en sécurité."""
     recent_history = history[-10:]
@@ -275,12 +384,24 @@ def generate_user_response(
             continue
 
         candidate = _normalize_plain_text(content.strip())
-        issues = _validate_recommendation_response(candidate, business_context)
+        validation_context = {
+            **business_context,
+            "_validation_device_catalog": validation_device_catalog or [],
+        }
+        issues = _validate_recommendation_response(candidate, validation_context)
         if not issues:
             return candidate
 
-    # Pas de texte métier écrit à la main en remplacement du LLM : on refuse
-    # simplement de publier une réponse non conforme.
+    # Une absence d'offre n'est pas une panne. Ne pas exposer une erreur serveur
+    # si les deux candidats LLM ont échoué à verbaliser ce résultat ordinaire.
+    # Ce recours se limite aux faits STRUCTURÉS déjà calculés par le graphe.
+    fallback = _no_offer_safe_fallback(business_context)
+    if fallback is not None and not _validate_recommendation_response(
+        fallback, {**business_context, "_validation_device_catalog": validation_device_catalog or []}
+    ):
+        return fallback
+
+    # Pour les autres états, on échoue en sécurité sans inventer de transaction.
     raise ResponseValidationError(
         "Le générateur n'a pas produit de réponse conforme aux faits métier."
     )

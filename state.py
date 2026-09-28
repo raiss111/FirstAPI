@@ -11,6 +11,8 @@ class AgentState(TypedDict, total=False):
 
     # Contexte métier de recommandation
     budget: float | None
+    budget_currency: str | None  # Uniquement si explicite dans la demande
+    price_match_mode: str | None  # exact (« forfait de 40$ ») ou maximum (« budget 40$ »)
     requested_data_gb: float | None
     selected_offer_id: str | None
     selected_offer_name: str | None
@@ -20,6 +22,8 @@ class AgentState(TypedDict, total=False):
 
     # Résultats structurés des tools
     offers: list[dict[str, Any]]
+    lowest_available_offer: dict[str, Any] | None  # Indication si aucun match
+    available_offers: list[dict[str, Any]]  # Catalogue factuel si aucun prix ne correspond
     devices: list[dict[str, Any]]
     closest_device: dict[str, Any] | None
     device_budget_gap: float | None

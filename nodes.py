@@ -28,7 +28,7 @@ def save_user_message_node(state: AgentState):
 def _extract_budget_amount(message: str) -> float | None:
     """Extrait un budget explicite comme 'moins de 20$', 'budget 30' ou 'forfait de 30$'."""
     constrained = re.search(
-        r"(?:moins de|maximum|max|budget(?: de)?|jusqu['’]?a|jusqu['’]?à)\s*"
+        r"(?:moins de|maximum|max|budget(?:\s+(?:de|est(?:\s+de)?))?|jusqu['’]?a|jusqu['’]?à)\s*"
         r"(?:\$|usd|dollars?)?\s*(\d+(?:[.,]\d+)?)",
         message,
         flags=re.IGNORECASE,
@@ -54,6 +54,36 @@ def _extract_budget_amount(message: str) -> float | None:
         return float(prefix.group(1).replace(",", "."))
 
     return None
+
+
+def _explicit_budget_currency(message: str) -> str | None:
+    """Normalise la devise EXPLICITEMENT accolée au montant dans cette demande.
+
+    La sélection actuelle des forfaits ne gère que les montants USD ; aucun USD
+    implicite n'est attribué à « budget 2 » sans symbole ni devise.
+    """
+    amount = r"\d+(?:[.,]\d+)?"
+    if re.search(rf"(?:{amount}\s*(?:\$|USD\b|dollars?\b)|(?:\$|USD\b)\s*{amount})", message, re.I):
+        return "USD"
+    return None
+
+
+def _price_match_mode(message: str, intent: str | None) -> str:
+    """Précise la sémantique d'un montant, sans faire choisir l'offre au LLM.
+
+    « forfait de 40$ » : prix demandé (exact).
+    « budget maximum 40$ », « moins de 40$ » : plafond (maximum).
+    Une recommandation avec une enveloppe chiffrée reste un plafond.
+    Le mode n'a d'effet que lorsque le tour fournit un nouveau montant.
+    """
+    if re.search(
+        r"(?:moins\s+de|en\s+dessous\s+de|maximum|max(?:imum)?\b|"
+        r"budget\b|jusqu['’]?\s*[aà]|au\s+plus|pas\s+plus\s+de|"
+        r"under\b|at\s+most\b|up\s+to\b|within\s+(?:my\s+)?budget)",
+        message, re.I,
+    ):
+        return "maximum"
+    return "exact" if intent == "BUY_PREPAID" else "maximum"
 
 
 def _extract_requested_data_gb(message: str) -> float | None:
@@ -96,11 +126,15 @@ def extract_context_node(state: AgentState):
         # Un plan nommé explicitement prime sur un vieux budget hérité : la
         # personne peut changer d'offre au milieu d'une même conversation.
         updates["budget"] = None
+        updates["budget_currency"] = None
+        updates["price_match_mode"] = None
         updates["requested_data_gb"] = None
         updates["selected_offer_id"] = "PRE_001"
         updates["selected_offer_name"] = "Flexi Data Max"
     elif "eco prepaid" in message_lower:
         updates["budget"] = None
+        updates["budget_currency"] = None
+        updates["price_match_mode"] = None
         updates["requested_data_gb"] = None
         updates["selected_offer_id"] = "PRE_002"
         updates["selected_offer_name"] = "Eco Prepaid"
@@ -123,6 +157,9 @@ def extract_context_node(state: AgentState):
             updates["max_price"] = amount
         else:
             updates["budget"] = amount
+            # Réinitialiser aussi l'unité si un nouveau budget remplace l'ancien.
+            updates["budget_currency"] = _explicit_budget_currency(message)
+            updates["price_match_mode"] = _price_match_mode(message, intent)
 
     return updates
 
@@ -201,16 +238,42 @@ def _select_offer_from_results(
 
 
 def _offer_result(state: AgentState, *, is_recommendation: bool) -> dict:
-    offers = get_prepaid_offers_mock.invoke(
-        {"user_budget_max": state.get("budget")}
+    # Consulter une fois le catalogue complet. Pour un prix *exact*, « 40$ »
+    # ne signifie pas « n'importe quel forfait coûtant moins de 40$ ».
+    # La liste complète reste un contexte informatif, jamais une sélection.
+    full_catalogue = get_prepaid_offers_mock.invoke({"user_budget_max": None})
+    available_offers = _filter_offers_by_data(
+        full_catalogue, state.get("requested_data_gb")
     )
-    offers = _filter_offers_by_data(offers, state.get("requested_data_gb"))
+    amount = state.get("budget")
+    if amount is None:
+        offers = list(available_offers)
+    elif state.get("price_match_mode") == "exact":
+        offers = [
+            offer for offer in available_offers
+            if float(offer["price_monthly"]) == float(amount)
+        ]
+    else:
+        offers = [
+            offer for offer in available_offers
+            if float(offer["price_monthly"]) <= float(amount)
+        ]
     selected, basis = _select_offer_from_results(
         state, offers, is_recommendation=is_recommendation
     )
 
+    # Un budget inférieur au catalogue ne constitue PAS une erreur technique.
+    # Retourner le prix minimal métier comme fait vérifiable facultatif pour
+    # que le verbaliseur puisse expliquer la limite sans rien inventer.
+    lowest_available_offer = (
+        min(available_offers, key=lambda offer: float(offer["price_monthly"]))
+        if not offers and available_offers else None
+    )
+
     return {
         "offers": offers,
+        "available_offers": available_offers if not offers else [],
+        "lowest_available_offer": lowest_available_offer,
         "selected_offer_id": selected["offer_id"] if selected else None,
         "selected_offer_name": selected["name"] if selected else None,
         "selection_basis": basis,
@@ -229,7 +292,9 @@ def get_offers_node(state: AgentState):
 def get_devices_node(state: AgentState):
     """Cherche d'abord dans le budget, puis calcule l'option compatible la plus proche."""
     offer_id = state.get("selected_offer_id")
-    offer_updates = {}
+    # Une ancienne absence d'offre n'est pas pertinente pour une recherche
+    # d'appareil ultérieure.
+    offer_updates = {"lowest_available_offer": None, "available_offers": []}
 
     # Une référence explicite à un forfait de N Go prime sur une sélection
     # antérieure : "pour mon forfait de 5 Go" désigne ici PRE_002. On ne
@@ -246,6 +311,7 @@ def get_devices_node(state: AgentState):
             plan = matching_plans[0]
             offer_id = plan["offer_id"]
             offer_updates = {
+                **offer_updates,
                 "selected_offer_id": plan["offer_id"],
                 "selected_offer_name": plan["name"],
                 "selection_basis": "explicit_data_plan",

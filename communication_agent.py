@@ -11,6 +11,7 @@ from llm_response_generator import generate_user_response
 from recommendation_graph import recommendation_graph
 from tobi_session_manager import process_tobi_message
 from tobi_services_mock import purchase_prepaid_mock
+from tools import get_compatible_devices_mock, get_prepaid_offers_mock
 
 
 # Les routes FastAPI synchrones peuvent tourner dans plusieurs threads.
@@ -76,10 +77,14 @@ def _safe_recommendation_data(result: dict[str, Any]) -> dict[str, Any]:
         "selected_offer_name": result.get("selected_offer_name"),
         "selection_basis": result.get("selection_basis"),
         "budget": result.get("budget"),
+        "budget_currency": result.get("budget_currency"),
+        "price_match_mode": result.get("price_match_mode"),
         "requested_data_gb": result.get("requested_data_gb"),
         "max_price": result.get("max_price"),
         "category_preference": result.get("category_preference"),
         "offers": result.get("offers", []),
+        "lowest_available_offer": result.get("lowest_available_offer"),
+        "available_offers": result.get("available_offers", []),
         "devices": result.get("devices", []),
         "closest_device": result.get("closest_device"),
         "device_budget_gap": result.get("device_budget_gap"),
@@ -326,12 +331,31 @@ def handle_user_message(
         "tobi_state": tobi_data,
     }
 
+    # Catalogue de contrôle, et NON de recommandation : le générateur ne le
+    # reçoit pas dans son prompt. Sert uniquement à rejeter un appareil connu
+    # mais absent du résultat calculé pour l'offre concernée (ex. Samsung avec
+    # PRE_002). Tous les choix métier restent dans le Recommendation Agent.
+    validation_device_catalog = []
+    if effective_intent == "RECOMMEND_DEVICE":
+        by_id = {}
+        for catalog_offer in get_prepaid_offers_mock.invoke({"user_budget_max": None}):
+            for device in get_compatible_devices_mock.invoke({
+                "offer_id": catalog_offer["offer_id"]
+            }):
+                by_id[device["device_id"]] = {
+                    "device_id": device["device_id"],
+                    "brand": device["brand"],
+                    "model": device["model"],
+                }
+        validation_device_catalog = list(by_id.values())
+
     response_text = generate_user_response(
         client,
         user_message=message,
         business_context=business_context,
         history=previous_history,
         preferred_language=profile.get("preferred_language"),
+        validation_device_catalog=validation_device_catalog,
     )
 
     history.append({"role": "user", "content": message})
